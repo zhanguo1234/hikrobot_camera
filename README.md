@@ -131,6 +131,16 @@ ros2 run hikrobot_camera fake_camera_publisher
 | 话题 | 类型 | 说明 |
 |---|---|---|
 | `<topic_name>`（默认 `/image_raw`） | `sensor_msgs/msg/Image` | 相机图像 |
+| `~/measured_frame_rate` | `std_msgs/msg/Float32` | **实际采集帧率**（1 Hz 刷新） |
+
+> **设定帧率 vs 实际帧率**：参数 `frame_rate` 是**你想要**的帧率（写入相机的
+> `AcquisitionFrameRate`）；而实际能跑多少还受**曝光时间、USB 带宽、主机处理速度**
+> 限制，通常小于等于设定值。节点每秒统计一次真实帧率，同时：
+>
+> - 发布到 `~/measured_frame_rate`（即 `/hik_camera_node/measured_frame_rate`）
+> - 在终端日志打印 `实际采集帧率 xx.xx fps（设定值 yy.yy fps）`
+>
+> 例如曝光设成 200000 µs（0.2 秒）时，设定 165 fps，实际只能跑到约 5 fps。
 
 图像 `encoding` 取决于相机当前的像素格式：
 
@@ -193,6 +203,25 @@ ros2 param set /hik_camera_node pixel_format xyz
    `fMin` / `fMax` 再比对，换相机也不会失效。
 2. **手动设置曝光/增益前会先关闭对应的自动模式**（`ExposureAuto=0` / `GainAuto=0`），
    否则相机在自动模式下会忽略写入。
+
+### 6.2 对比设定帧率与实际帧率
+
+```bash
+# 设定值
+ros2 param get /hik_camera_node frame_rate
+
+# 实际值（节点每秒统计）
+ros2 topic echo /hik_camera_node/measured_frame_rate
+
+# 也可以直接看图像话题的实际频率
+ros2 topic hz /image_raw
+```
+
+节点日志里每秒也会打印一行，两者直接对照：
+
+```
+[INFO] [...] 实际采集帧率 69.86 fps（设定值 165.00 fps）
+```
 
 ---
 
@@ -328,6 +357,9 @@ ros2 topic list | grep image_raw
 ros2 topic hz /image_raw
 ros2 topic echo /image_raw --once --field encoding      # bgr8
 ros2 topic echo /image_raw --once --field width         # 1440
+
+# 3b) 实际采集帧率（与设定值区分）
+ros2 topic echo /hik_camera_node/measured_frame_rate
 
 # 4) rqt_image_view / rviz2 中图像显示正常
 

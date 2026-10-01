@@ -9,6 +9,7 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 
 # ========== 关键：提前链接海康库 ==========
 # 告诉编译器去哪找海康的头文件
@@ -21,7 +22,7 @@ target_link_libraries(fake_camera_publisher /opt/MVS/lib/64/libMvCameraControl.s
 
 # ---------- 真实相机节点 ----------
 add_executable(hik_camera_node src/hik_camera_node.cpp)
-ament_target_dependencies(hik_camera_node rclcpp sensor_msgs)
+ament_target_dependencies(hik_camera_node rclcpp sensor_msgs std_msgs)
 target_link_libraries(hik_camera_node /opt/MVS/lib/64/libMvCameraControl.so)
 
 # 关键：安装后的可执行文件也要找得到海康的 .so

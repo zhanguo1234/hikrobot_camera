@@ -11,6 +11,7 @@
 
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/image.hpp"
+#include "std_msgs/msg/float32.hpp"
 #include "MvCameraControl.h"
 
 class HikCameraNode : public rclcpp::Node
@@ -34,6 +35,9 @@ public:
 
         // 发布者：话题名来自参数
         publisher_ = create_publisher<sensor_msgs::msg::Image>(topic_name_, 10);
+
+        // 实际采集帧率（每秒更新一次），用于和参数里的"设定帧率"区分开
+        fps_publisher_ = create_publisher<std_msgs::msg::Float32>("~/measured_frame_rate", 10);
 
         // 注册参数回调：运行中执行 ros2 param set 会走到 on_set_parameters
         param_cb_ = add_on_set_parameters_callback(
@@ -413,6 +417,24 @@ private:
         ret = MV_CC_OpenDevice(handle_, MV_ACCESS_Exclusive, 0);
         if (ret != MV_OK) {
             RCLCPP_ERROR(get_logger(), "MV_CC_OpenDevice 失败: 0x%X", ret);
+            switch (static_cast<unsigned int>(ret)) {
+                case 0x80000203u:
+                    RCLCPP_ERROR(get_logger(),
+                                 "  含义 MV_E_ACCESS_DENIED：相机被别的程序占用。"
+                                 "先确认 ros2 node list 里没有其它相机节点，并关闭 MVS 客户端");
+                    break;
+                case 0x80000006u:
+                case 0x80000028u:
+                    RCLCPP_ERROR(get_logger(),
+                                 "  含义 MV_E_RESOURCE / 资源已被占用：同一时刻只能有一个程序打开相机");
+                    break;
+                case 0x80000301u:
+                    RCLCPP_ERROR(get_logger(),
+                                 "  含义 MV_E_USB_WRITE：USB 通信异常，把相机拔下来重新插一次即可");
+                    break;
+                default:
+                    break;
+            }
             MV_CC_DestroyHandle(handle_);
             handle_ = nullptr;
             return false;
@@ -461,6 +483,8 @@ private:
     void grab_loop()
     {
         MV_FRAME_OUT frame;
+        unsigned int frame_count = 0;
+        auto window_start = std::chrono::steady_clock::now();
 
         while (running_) {
             // 如果 ROS 线程正在等这把锁，先让它拿到，避免它被这个紧循环饿死
@@ -468,6 +492,7 @@ private:
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
 
+            bool got_frame = false;
             {
                 std::lock_guard<std::mutex> lock(sdk_mutex_);
                 if (!running_) {
@@ -478,7 +503,6 @@ private:
                     // ---- 掉线状态：尝试重连 ----
                     if (open_camera()) {
                         RCLCPP_INFO(get_logger(), "相机已重新连接，参数已恢复");
-                        continue;
                     }
                 } else {
                     memset(&frame, 0, sizeof(frame));
@@ -488,10 +512,8 @@ private:
                         no_frame_count_ = 0;
                         publish_frame(frame);
                         MV_CC_FreeImageBuffer(handle_, &frame);
-                        continue;
-                    }
-
-                    if (static_cast<unsigned int>(ret) == MV_E_NODATA) {
+                        got_frame = true;
+                    } else if (static_cast<unsigned int>(ret) == MV_E_NODATA) {
                         // 超时本身是正常的；但长时间一帧都没有，说明设备已经掉了
                         //（USB 被拔掉时 SDK 常常一直报超时而不报错）
                         if (++no_frame_count_ > kNoFrameLimit) {
@@ -507,6 +529,35 @@ private:
                         no_frame_count_ = 0;
                     }
                 }
+            }
+
+            if (got_frame) {
+                ++frame_count;
+            }
+
+            // ---- 每秒统计一次「实际采集帧率」 ----
+            // 它和参数 frame_rate_（设定值）是两回事：实际值还会受曝光时间、
+            // USB 带宽、主机处理速度限制，所以通常小于等于设定值。
+            const auto now_tp = std::chrono::steady_clock::now();
+            const double elapsed =
+                std::chrono::duration<double>(now_tp - window_start).count();
+            if (elapsed >= 1.0) {
+                const double measured = frame_count / elapsed;
+
+                std_msgs::msg::Float32 msg;
+                msg.data = static_cast<float>(measured);
+                fps_publisher_->publish(msg);
+
+                if (frame_rate_ > 0.0) {
+                    RCLCPP_INFO(get_logger(), "实际采集帧率 %.2f fps（设定值 %.2f fps）",
+                                measured, frame_rate_);
+                } else {
+                    RCLCPP_INFO(get_logger(), "实际采集帧率 %.2f fps（未设置帧率参数）",
+                                measured);
+                }
+
+                frame_count = 0;
+                window_start = now_tp;
             }
 
             // 没连上时，等 2 秒再试（分片睡眠，保证能及时退出）
@@ -585,6 +636,7 @@ private:
     static constexpr int kNoFrameLimit = 25;   // 25 × 200ms = 5 秒没图就判定掉线
 
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr publisher_;
+    rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr fps_publisher_;
     rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_;
 
     void * handle_{nullptr};
