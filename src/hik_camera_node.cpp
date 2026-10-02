@@ -28,7 +28,10 @@ public:
         camera_ip_     = declare_parameter<std::string>("camera_ip", "");
         topic_name_    = declare_parameter<std::string>("topic_name", "image_raw");
         frame_id_      = declare_parameter<std::string>("frame_id", "camera");
-        pixel_format_  = declare_parameter<std::string>("pixel_format", "BayerRG8");
+        // 空字符串 = 不改动相机的像素格式，沿用相机自己的设置。
+        // 不同型号支持的格式不同（黑白相机没有 Bayer 系列），
+        // 所以不给默认值，避免把不适用的格式强加给相机。
+        pixel_format_  = declare_parameter<std::string>("pixel_format", "");
         exposure_time_ = declare_parameter<double>("exposure_time", -1.0);
         gain_          = declare_parameter<double>("gain", -1.0);
         frame_rate_    = declare_parameter<double>("frame_rate", -1.0);
@@ -104,7 +107,9 @@ private:
         unsigned int value = 0;
         if (!pixel_format_value(name, value)) {
             return "不支持的像素格式: " + name +
-                   "（可选 Mono8 / BayerRG8 / BayerRG10 / BayerRG12 / RGB8 / BGR8 / YUV422_YUYV / YUV422）";
+                   "（本包可识别 Mono8 / BayerRG8 / BayerRG10 / BayerRG12 / "
+                   "RGB8 / BGR8 / YUV422_YUYV / YUV422；不同型号支持范围不同，"
+                   "留空则沿用相机自身设置）";
         }
 
         const bool was_grabbing = grabbing_;
@@ -316,9 +321,17 @@ private:
                     frame_rate_ = v;
                 }
             } else if (name == "pixel_format") {
-                err = apply_pixel_format(p.as_string());
+                const std::string v = p.as_string();
+                if (v.empty()) {
+                    // 空字符串 = 不改动相机当前像素格式
+                    pixel_format_ = "";
+                    RCLCPP_INFO(get_logger(),
+                                "pixel_format 已清空：之后不再改动相机的像素格式");
+                    continue;
+                }
+                err = apply_pixel_format(v);
                 if (err.empty()) {
-                    pixel_format_ = p.as_string();
+                    pixel_format_ = v;
                 }
             } else if (name == "frame_id") {
                 frame_id_ = p.as_string();
@@ -440,12 +453,27 @@ private:
             return false;
         }
 
+        // ---- 关闭触发模式，改为连续采集 ----
+        // 这一步对兼容性很重要：如果相机被别人设成了触发模式（软触发/硬触发），
+        // 不关掉的话一帧都收不到，而且不会报任何错误，极难排查。
+        ret = MV_CC_SetEnumValue(handle_, "TriggerMode", 0);
+        if (ret != MV_OK) {
+            RCLCPP_WARN(get_logger(),
+                        "关闭触发模式失败 0x%X（若相机正处于触发模式，将收不到图像）", ret);
+        }
+
         // 连上后立刻恢复全部已配置参数（重连成功后同样走这里）
         apply_startup_params();
-        std::string err = apply_pixel_format(pixel_format_);
-        if (!err.empty()) {
-            RCLCPP_ERROR(get_logger(), "恢复 pixel_format 失败: %s", err.c_str());
+
+        // pixel_format 为空表示"不改动相机当前格式"，只有用户显式指定时才设置
+        if (!pixel_format_.empty()) {
+            std::string err = apply_pixel_format(pixel_format_);
+            if (!err.empty()) {
+                RCLCPP_ERROR(get_logger(), "恢复 pixel_format 失败: %s", err.c_str());
+            }
         }
+
+        log_camera_info();
 
         ret = MV_CC_StartGrabbing(handle_);
         if (ret != MV_OK) {
@@ -456,6 +484,51 @@ private:
         grabbing_ = true;
         no_frame_count_ = 0;
         return true;
+    }
+
+    // 打印相机的关键信息。换型号时一眼就能看清它当前是什么格式、支持哪些量程。
+    void log_camera_info()
+    {
+        // 当前像素格式 + 该型号支持的格式数量
+        MVCC_ENUMVALUE_EX pf;
+        memset(&pf, 0, sizeof(pf));
+        if (MV_CC_GetEnumValueEx(handle_, "PixelFormat", &pf) == MV_OK) {
+            MVCC_ENUMENTRY entry;
+            memset(&entry, 0, sizeof(entry));
+            entry.nValue = pf.nCurValue;
+            if (MV_CC_GetEnumEntrySymbolic(handle_, "PixelFormat", &entry) == MV_OK) {
+                RCLCPP_INFO(get_logger(), "当前像素格式: %s（本型号共支持 %u 种）",
+                            entry.chSymbolic, pf.nSupportedNum);
+            }
+        } else {
+            RCLCPP_WARN(get_logger(), "读取 PixelFormat 失败");
+        }
+
+        // 分辨率
+        MVCC_INTVALUE_EX w, h;
+        memset(&w, 0, sizeof(w));
+        memset(&h, 0, sizeof(h));
+        if (MV_CC_GetIntValueEx(handle_, "Width", &w) == MV_OK &&
+            MV_CC_GetIntValueEx(handle_, "Height", &h) == MV_OK)
+        {
+            RCLCPP_INFO(get_logger(), "分辨率: %ld x %ld",
+                        (long)w.nCurValue, (long)h.nCurValue);
+        }
+
+        // 曝光 / 增益 / 帧率的当前值与量程
+        log_float_range("ExposureTime");
+        log_float_range("Gain");
+        log_float_range("AcquisitionFrameRate");
+    }
+
+    void log_float_range(const char * key)
+    {
+        MVCC_FLOATVALUE v;
+        memset(&v, 0, sizeof(v));
+        if (MV_CC_GetFloatValue(handle_, key, &v) == MV_OK) {
+            RCLCPP_INFO(get_logger(), "%-22s 当前=%.2f  范围=[%.2f, %.2f]",
+                        key, v.fCurValue, v.fMin, v.fMax);
+        }
     }
 
     // 调用者必须已持有 sdk_mutex_

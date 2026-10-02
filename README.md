@@ -80,10 +80,12 @@ ros2 launch hikrobot_camera hik_camera.launch.py
 ```bash
 ros2 launch hikrobot_camera hik_camera.launch.py \
     camera_serial:=DB0178696 \
-    pixel_format:=BayerRG8 \
     exposure_time:=5000.0 \
     gain:=5.0
 ```
+
+> `pixel_format` 默认留空（沿用相机自身的格式），一般不用指定。
+> 需要时再加 `pixel_format:=Mono8` 等。
 
 > launch 文件里已通过 `AppendEnvironmentVariable` 自动设置
 > `LD_LIBRARY_PATH=/opt/MVS/lib/64`，**不需要你手动 export**。
@@ -163,15 +165,21 @@ ros2 run hikrobot_camera fake_camera_publisher
 | `camera_ip` | string | `""` | 按 IP 选择相机（GigE） |
 | `topic_name` | string | `image_raw` | 图像话题名（**改动需重启**） |
 | `frame_id` | string | `camera` | 图像消息的 `frame_id` |
-| `pixel_format` | string | `BayerRG8` | 见下表 |
+| `pixel_format` | string | `""`（留空） | 留空 = **沿用相机自身的像素格式**；只有显式指定时才会去改相机 |
 | `exposure_time` | double | `-1.0` | 曝光时间 µs，**负值表示不修改相机** |
 | `gain` | double | `-1.0` | 增益 dB，**负值表示不修改相机** |
 | `frame_rate` | double | `-1.0` | 采集帧率 fps，**负值表示不修改相机** |
 
 `camera_serial` 与 `camera_ip` 都留空时，连接枚举到的第一台相机。
 
-`pixel_format` 可选值：`Mono8`、`BayerRG8`、`BayerRG10`、`BayerRG12`、
-`RGB8`、`BGR8`、`YUV422_YUYV`、`YUV422`
+`pixel_format` 可填的值（**留空是最省事、兼容性最好的选择**）：
+`Mono8`、`BayerRG8`、`BayerRG10`、`BayerRG12`、`RGB8`、`BGR8`、
+`YUV422_YUYV`、`YUV422`
+
+> **为什么默认留空**：不同型号支持的像素格式差别很大——黑白相机只有
+> Mono 系列，没有 Bayer 系列。如果给一个 `BayerRG8` 之类的默认值，
+> 换一台黑白相机就会在启动时报错。留空表示"相机原来是什么格式就用什么格式"，
+> 兼容性最好。需要指定时再显式填。
 
 ### 6.1 运行期调参示例
 
@@ -245,6 +253,45 @@ ros2 topic hz /image_raw
 
 > 结论：**务必插在 USB 3.0 口**（通常为蓝色口）。
 > 用 `lsusb | grep 2bdf` 可以确认相机挂在哪个总线上：`Bus 002` 是 USB 3.0，`Bus 001` 是 USB 2.0。
+
+---
+
+## 7.1 适用型号与已知限制
+
+**本包只在 `MV-CS016-10UC`（USB3、彩色、1440×1080）上做过完整实测**，
+其余型号的情况是按海康 SDK 的通用接口设计的，属于推断而非实测结论。
+
+### 与型号无关的通用机制
+
+- 设备枚举、按序列号 / IP 匹配连接
+- 取流（`MV_CC_StartGrabbing` / `MV_CC_GetImageBuffer` / `MV_CC_FreeImageBuffer`）
+- 分辨率：从帧信息读取，不硬编码
+- 参数量程：每次从相机 `MV_CC_GetFloatValue` 读回 `fMin`/`fMax`，不写死
+- 像素格式转换：`MV_CC_ConvertPixelTypeEx`，任意源格式 → BGR8
+- 断线重连与参数恢复
+
+### 针对型号差异做的兼容处理
+
+| 处理 | 解决什么问题 |
+|---|---|
+| 启动时下发 `TriggerMode = 0` | 相机若处于**触发模式**（软/硬触发），不关掉就一帧都收不到，且不报错。现在会自动改为连续采集 |
+| `pixel_format` 默认**留空** | 黑白相机没有 Bayer 系列，若给默认值会启动报错。留空则沿用相机自身格式 |
+| 启动时打印相机实际信息 | 日志会输出**当前像素格式、分辨率、曝光/增益/帧率量程**，换型号时一眼看清 |
+| 参数设置前读回量程 | 不同型号的量程差异极大，不写死 |
+| `AcquisitionFrameRateEnable` 失败只警告 | 部分型号没有这个节点，此时仍继续尝试写入帧率 |
+
+### 尚未验证 / 未实现的部分
+
+| 项目 | 说明 |
+|---|---|
+| **网口（GigE）相机** | 代码支持按 IP 匹配连接，但**未做 GigE 专属优化**（`GevSCPSPacketSize` 最优包大小、心跳超时、丢包重传）。接网口相机时可能丢包或帧率偏低，**未实测** |
+| **黑白相机** | 设计上兼容（`Mono8` 直发、`pixel_format` 留空），但**未实测** |
+| 其他像素格式 | 只内置了 8 种常见格式的名字映射；若相机使用 `Mono10`、`BayerGB8` 等，`pixel_format` 参数填不进去——但**留空即可正常出图**（此时若格式非 BGR8/Mono8/RGB8，会经 SDK 转换） |
+| 多相机同时接入 | 单节点只连一台；多相机需启动多个节点，分别指定 `camera_serial` 与 `topic_name` |
+| `camera_info` 标定 | 未实现 |
+
+> **结论**：换用**连续采集模式下的海康标准 USB3 相机**（彩色或黑白）预期可直接使用；
+> 换用**网口相机**需要额外验证。
 
 ---
 
@@ -337,6 +384,10 @@ USB 通信异常。**先拔掉相机重新插一次**，一般即可恢复，不
 - **断线重连**：取流返回非超时错误 → 关闭句柄并进入重连；
   另外**连续 5 秒收不到图**也会判定掉线（USB 被拔时 SDK 常常只报超时而
   不报错）。掉线后每 2 秒重新枚举并连接，连接成功后自动重新下发全部参数。
+- **型号兼容性**：启动时主动下发 `TriggerMode = 0` 关闭触发（否则相机若处于
+  触发模式会一帧都收不到且不报错）；`pixel_format` 默认留空、沿用相机自身设置，
+  避免把黑白相机不支持的 Bayer 格式强加给它；连接成功后打印相机的
+  当前像素格式、分辨率和各参数量程。
 
 ---
 
@@ -383,12 +434,15 @@ ros2 param set /hik_camera_node exposure_time 150000.0  # 先设一个好认的�
 
 ## 11. 已知限制
 
+- **只在 `MV-CS016-10UC`（USB3、彩色）上做过完整实测**；网口相机与黑白相机
+  属于设计上兼容但未实测，详见第 7.1 节。
 - 断线重连采用「错误码 + 5 秒无图」双重判定；若把 `frame_rate` 设到
   低于 0.2 fps，5 秒无图会误判为掉线。正常使用（≥1 fps）不受影响。
 - 不支持多相机同时接入同一节点；多相机请为每个节点指定不同的
   `camera_serial` 与 `topic_name`。
 - 未使用 `image_transport` 压缩传输，发布的是原始 `Image`。
 - 未实现相机标定（`camera_info`）发布。
+- 网口相机缺少 GigE 专属优化（最优包大小、心跳超时），可能丢包或帧率偏低。
 
 ---
 

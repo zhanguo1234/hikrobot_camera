@@ -29,8 +29,9 @@ def generate_launch_description():
             'frame_id', default_value='camera',
             description='图像消息的 frame_id'),
         DeclareLaunchArgument(
-            'pixel_format', default_value='BayerRG8',
-            description='Mono8 / BayerRG8 / BayerRG10 / BayerRG12 / '
+            'pixel_format', default_value='',
+            description='留空 = 沿用相机自身的像素格式（推荐，兼容黑白/彩色各型号）；'
+                        '也可指定 Mono8 / BayerRG8 / BayerRG10 / BayerRG12 / '
                         'RGB8 / BGR8 / YUV422_YUYV / YUV422'),
         DeclareLaunchArgument(
             'exposure_time', default_value='-1.0',
